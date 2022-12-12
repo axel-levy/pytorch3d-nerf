@@ -62,7 +62,7 @@ def main(cfg: DictConfig):
     if not os.path.isfile(checkpoint_path):
         raise ValueError(f"Model checkpoint {checkpoint_path} does not exist!")
 
-    print(f"Loading checkpoint {checkpoint_path}.")
+    print('Loading checkpoint {}.'.format(checkpoint_path))
     loaded_data = torch.load(checkpoint_path)
     # Do not load the cached xy grid.
     # - this allows setting an arbitrary evaluation image size.
@@ -144,12 +144,12 @@ def main(cfg: DictConfig):
             # Store the video frame.
             frame = test_nerf_out["rgb_fine"][0].detach().cpu()
             frame_path = os.path.join(export_dir, f"frame_{batch_idx:05d}.png")
-            print(f"Writing {frame_path}.")
+            print('Writing {}.'.format(frame_path))
             Image.fromarray((frame.numpy() * 255.0).astype(np.uint8)).save(frame_path)
             frame_paths.append(frame_path)
 
     if cfg.test.mode == "evaluation":
-        print(f"Final evaluation metrics on '{cfg.data.dataset_name}':")
+        print('Final evaluation metrics on {}:'.format(cfg.data.dataset_name))
         for stat in eval_stats:
             stat_value = stats.stats["test"][stat].get_epoch_averages()[0]
             print(f"{stat:15s}: {stat_value:1.4f}")

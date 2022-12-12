@@ -17,6 +17,7 @@ from .implicit_function import NeuralRadianceField
 from .raymarcher import EmissionAbsorptionNeRFRaymarcher
 from .raysampler import NeRFRaysampler, ProbabilisticRaysampler
 from .utils import calc_mse, calc_psnr, sample_images_at_mc_locs
+from .camera_predictor import AzimuthElevationCameraPredictor
 
 
 class RadianceFieldRenderer(torch.nn.Module):
@@ -67,6 +68,10 @@ class RadianceFieldRenderer(torch.nn.Module):
         n_hidden_neurons_xyz: int = 256,
         n_hidden_neurons_dir: int = 128,
         n_layers_xyz: int = 8,
+        camera_predictor_type: str = 'gt',
+        depth_camera_predictor: int = 4,
+        channels_camera_predictor: int = 16,
+        kernel_size_camera_predictor: int = 3,
         append_xyz: Tuple[int, ...] = (5,),
         density_noise_std: float = 0.0,
         visualization: bool = False,
@@ -102,6 +107,10 @@ class RadianceFieldRenderer(torch.nn.Module):
                 (per-point colors).
             n_layers_xyz: The number of layers of the MLP that outputs the
                 occupancy field.
+            camera_predictor_type: Type of camera predictor.
+            depth_camera_predictor: depth of camera predictor.
+            channels_camera_predictor: number of channels of camera predictor.
+            kernel_size_camera_predictor: kernel size of camera predictor.
             append_xyz: The list of indices of the skip layers of the occupancy MLP.
                 Prior to evaluating the skip layers, the tensor which was input to MLP
                 is appended to the skip layer input.
@@ -161,6 +170,17 @@ class RadianceFieldRenderer(torch.nn.Module):
                 n_hidden_neurons_dir=n_hidden_neurons_dir,
                 n_layers_xyz=n_layers_xyz,
                 append_xyz=append_xyz,
+            )
+
+        if camera_predictor_type == 'gt':
+            self.camera_predictor = None
+        elif camera_predictor_type == 'cnn':
+            assert image_height == image_width
+            self.camera_predictor = AzimuthElevationCameraPredictor(
+                image_height,
+                depth=depth_camera_predictor,
+                channels=channels_camera_predictor,
+                kernel_size=kernel_size_camera_predictor
             )
 
         self._density_noise_std = density_noise_std
@@ -269,7 +289,7 @@ class RadianceFieldRenderer(torch.nn.Module):
     def forward(
         self,
         camera_hash: Optional[str],
-        camera: CamerasBase,
+        camera_gt: CamerasBase,
         image: torch.Tensor,
     ) -> Tuple[dict, dict]:
         """
@@ -290,7 +310,7 @@ class RadianceFieldRenderer(torch.nn.Module):
             camera_hash: A unique identifier of a pre-cached camera.
                 If `None`, the cache is not searched and the sampled rays are
                 calculated from scratch.
-            camera: A batch of cameras from which the scene is rendered.
+            camera_gt: A batch of cameras from which the scene is rendered.
             image: A batch of corresponding ground truth images of shape
                 ('batch_size', ·, ·, 3).
         Returns:
@@ -322,11 +342,16 @@ class RadianceFieldRenderer(torch.nn.Module):
             # Full evaluation pass.
             n_chunks = self._renderer["coarse"].raysampler.get_n_chunks(
                 self._chunk_size_test,
-                camera.R.shape[0],
+                camera_gt.R.shape[0],
             )
         else:
             # MonteCarlo ray sampling.
             n_chunks = 1
+
+        if self.camera_predictor is None:
+            camera = camera_gt
+        else:
+            camera = self.camera_predictor(image, camera_gt)
 
         # Process the chunks of rays.
         chunk_outputs = [

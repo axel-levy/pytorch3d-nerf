@@ -49,9 +49,10 @@ def sample_images_at_mc_locs(
     # The coordinate grid convention for grid_sample has both x and y
     # directions inverted.
     xy_sample = -sampled_rays_xy.view(ba, -1, 1, 2).clone()
+    inputs = target_images.permute(0, 3, 1, 2)
 
     images_sampled = torch.nn.functional.grid_sample(
-        target_images.permute(0, 3, 1, 2),
+        inputs,
         xy_sample,
         align_corners=True,
         mode="bilinear",

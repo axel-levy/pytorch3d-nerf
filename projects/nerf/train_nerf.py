@@ -23,9 +23,8 @@ from visdom import Visdom
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs")
 
 
-@hydra.main(config_path=CONFIG_DIR, config_name="lego")
-def main(cfg: DictConfig):
-
+@hydra.main(version_base=None, config_path=CONFIG_DIR, config_name="lego")
+def main(cfg):
     # Set the relevant seeds for reproducibility.
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -56,6 +55,10 @@ def main(cfg: DictConfig):
         n_hidden_neurons_xyz=cfg.implicit_function.n_hidden_neurons_xyz,
         n_hidden_neurons_dir=cfg.implicit_function.n_hidden_neurons_dir,
         n_layers_xyz=cfg.implicit_function.n_layers_xyz,
+        camera_predictor_type=cfg.camera_predictor.type,
+        depth_camera_predictor=cfg.camera_predictor.depth,
+        channels_camera_predictor=cfg.camera_predictor.channels,
+        kernel_size_camera_predictor=cfg.camera_predictor.kernel_size,
         density_noise_std=cfg.implicit_function.density_noise_std,
         visualization=cfg.visualization.visdom,
     )
@@ -76,11 +79,11 @@ def main(cfg: DictConfig):
 
         # Resume training if requested.
         if cfg.resume and os.path.isfile(checkpoint_path):
-            print(f"Resuming from checkpoint {checkpoint_path}.")
+            print('Resuming from checkpoint {}.'.format(checkpoint_path))
             loaded_data = torch.load(checkpoint_path)
             model.load_state_dict(loaded_data["model"])
             stats = pickle.loads(loaded_data["stats"])
-            print(f"   => resuming from epoch {stats.epoch}.")
+            print('   => resuming from epoch {}.'.format(stats.epoch))
             optimizer_state_dict = loaded_data["optimizer"]
             start_epoch = stats.epoch
 
@@ -143,6 +146,7 @@ def main(cfg: DictConfig):
                 cache_camera_hashes = [e["camera_idx"] for e in dataset]
                 model.precache_rays(cache_cameras, cache_camera_hashes)
 
+    print("Building training dataloader...")
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=1,
@@ -152,6 +156,7 @@ def main(cfg: DictConfig):
     )
 
     # The validation dataloader is just an endless stream of random samples.
+    print("Building testing dataloader...")
     val_dataloader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=1,
@@ -167,11 +172,12 @@ def main(cfg: DictConfig):
     # Set the model to the training mode.
     model.train()
 
+    print("Training starts now.")
     # Run the main training loop.
     for epoch in range(start_epoch, cfg.optimizer.max_epochs):
         stats.new_epoch()  # Init a new epoch.
         for iteration, batch in enumerate(train_dataloader):
-            image, camera, camera_idx = batch[0].values()
+            image, mask, camera, camera_idx = batch[0].values()
             image = image.to(device)
             camera = camera.to(device)
 
@@ -222,7 +228,7 @@ def main(cfg: DictConfig):
 
             # Sample a validation camera/image.
             val_batch = next(val_dataloader.__iter__())
-            val_image, val_camera, camera_idx = val_batch[0].values()
+            val_image, val_mask, val_camera, camera_idx = val_batch[0].values()
             val_image = val_image.to(device)
             val_camera = val_camera.to(device)
 
@@ -260,7 +266,7 @@ def main(cfg: DictConfig):
             and len(cfg.checkpoint_path) > 0
             and epoch > 0
         ):
-            print(f"Storing checkpoint {checkpoint_path}.")
+            print('Storing checkpoint {}.'.format(checkpoint_path))
             data_to_store = {
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),

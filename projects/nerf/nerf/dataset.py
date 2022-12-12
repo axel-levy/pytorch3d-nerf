@@ -89,11 +89,13 @@ def get_nerf_datasets(
     train_data = torch.load(cameras_path)
     n_cameras = train_data["cameras"]["R"].shape[0]
 
+    print("Loading images...")
     _image_max_image_pixels = Image.MAX_IMAGE_PIXELS
     Image.MAX_IMAGE_PIXELS = None  # The dataset image is very large ...
     images = torch.FloatTensor(np.array(Image.open(image_path))) / 255.0
     images = torch.stack(torch.chunk(images, n_cameras, dim=0))[..., :3]
     Image.MAX_IMAGE_PIXELS = _image_max_image_pixels
+    print("Done loading.")
 
     scale_factors = [s_new / s for s, s_new in zip(images.shape[1:3], image_size)]
     if abs(scale_factors[0] - scale_factors[1]) > 1e-3:
@@ -110,6 +112,8 @@ def get_nerf_datasets(
             mode="bilinear",
         ).permute(0, 2, 3, 1)
 
+    masks = (torch.norm(images, dim=-1) > 1e-6)
+
     cameras = [
         PerspectiveCameras(
             **{k: v[cami][None] for k, v in train_data["cameras"].items()}
@@ -122,7 +126,7 @@ def get_nerf_datasets(
     train_dataset, val_dataset, test_dataset = [
         ListDataset(
             [
-                {"image": images[i], "camera": cameras[i], "camera_idx": int(i)}
+                {"image": images[i], "mask": masks[i], "camera": cameras[i], "camera_idx": int(i)}
                 for i in idx
             ]
         )
