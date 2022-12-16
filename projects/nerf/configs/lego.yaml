@@ -1,12 +1,12 @@
 seed: 3
-resume: True
+resume: False
 stats_print_interval: 10
 validation_epoch_interval: 30
 checkpoint_epoch_interval: 30
-checkpoint_path: 'checkpoints/lego_pt3d.pth'
+checkpoint_path: 'checkpoints/lego_000.pth'
 data:
   dataset_name: 'lego'
-  image_size: [800, 800] # [height, width]
+  image_size: [128, 128] # [height, width]
   precache_rays: False
 test:
   mode: 'evaluation'
@@ -22,15 +22,15 @@ optimizer:
   lr_scheduler_step_size: 5000
   lr_scheduler_gamma: 0.1
 visualization:
-  history_size: 10
+  history_size: 16
   visdom: True
   visdom_server: 'sdf-login03'
   visdom_port: 8097
-  visdom_env: 'nerf_pytorch3d'
+  visdom_env: 'lego_000'
 raysampler:
   n_pts_per_ray: 32
   n_pts_per_ray_fine: 32
-  n_rays_per_image: 64
+  n_rays_per_image: 128
   min_depth: 2.0
   max_depth: 6.0
   stratified: True
@@ -43,8 +43,17 @@ implicit_function:
   n_hidden_neurons_dir: 128
   density_noise_std: 0.0
   n_layers_xyz: 8
+  view_dependency: True
 camera_predictor:
-  type: 'cnn'
+  type: 'gt'
   depth: 4
   channels: 16
   kernel_size: 3
+  northern_hemisphere: True
+tensorboard:
+  summary_dir: 'logs/test/lego_gt_000'
+loss_function:
+  mask_loss: True
+  mask_loss_weight: 1.0
+  replication_loss: False
+  replication_order: 2

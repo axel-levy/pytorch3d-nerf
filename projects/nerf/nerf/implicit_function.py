@@ -28,6 +28,7 @@ class NeuralRadianceField(torch.nn.Module):
         n_layers_xyz: int = 8,
         append_xyz: Tuple[int, ...] = (5,),
         use_multiple_streams: bool = True,
+        view_dependency: bool = True,
         **kwargs,
     ):
         """
@@ -49,6 +50,7 @@ class NeuralRadianceField(torch.nn.Module):
             append_xyz: The list of indices of the skip layers of the occupancy MLP.
             use_multiple_streams: Whether density and color should be calculated on
                 separate CUDA streams.
+            view_dependency: Whether the radiance field should be view-dependent.
         """
         super().__init__()
 
@@ -56,9 +58,13 @@ class NeuralRadianceField(torch.nn.Module):
         # to a representation that is more suitable for
         # processing with a deep neural network.
         self.harmonic_embedding_xyz = HarmonicEmbedding(n_harmonic_functions_xyz)
-        self.harmonic_embedding_dir = HarmonicEmbedding(n_harmonic_functions_dir)
         embedding_dim_xyz = n_harmonic_functions_xyz * 2 * 3 + 3
-        embedding_dim_dir = n_harmonic_functions_dir * 2 * 3 + 3
+        self.view_dependency = view_dependency
+        if view_dependency:
+            self.harmonic_embedding_dir = HarmonicEmbedding(n_harmonic_functions_dir)
+            embedding_dim_dir = n_harmonic_functions_dir * 2 * 3 + 3
+        else:
+            embedding_dim_dir = 0
 
         self.mlp_xyz = MLPWithInputSkips(
             n_layers_xyz,
@@ -81,14 +87,22 @@ class NeuralRadianceField(torch.nn.Module):
         # a completely transparent initialization.
         self.density_layer.bias.data[:] = 0.0  # fixme: Sometimes this is not enough
 
-        self.color_layer = torch.nn.Sequential(
-            LinearWithRepeat(
-                n_hidden_neurons_xyz + embedding_dim_dir, n_hidden_neurons_dir
-            ),
-            torch.nn.ReLU(True),
-            torch.nn.Linear(n_hidden_neurons_dir, 3),
-            torch.nn.Sigmoid(),
-        )
+        if view_dependency:
+            self.color_layer = torch.nn.Sequential(
+                LinearWithRepeat(
+                    n_hidden_neurons_xyz + embedding_dim_dir, n_hidden_neurons_dir
+                ),
+                torch.nn.ReLU(True),
+                torch.nn.Linear(n_hidden_neurons_dir, 3),
+                torch.nn.Sigmoid(),
+            )
+        else:
+            self.color_layer = torch.nn.Sequential(
+                torch.nn.Linear(n_hidden_neurons_xyz, n_hidden_neurons_xyz // 2),
+                torch.nn.ReLU(True),
+                torch.nn.Linear(n_hidden_neurons_xyz // 2, 3),
+                torch.nn.Sigmoid(),
+            )
         self.use_multiple_streams = use_multiple_streams
 
     def _get_densities(
@@ -130,9 +144,13 @@ class NeuralRadianceField(torch.nn.Module):
         rays_directions_normed = torch.nn.functional.normalize(rays_directions, dim=-1)
 
         # Obtain the harmonic embedding of the normalized ray directions.
-        rays_embedding = self.harmonic_embedding_dir(rays_directions_normed)
+        if self.view_dependency:
+            rays_embedding = self.harmonic_embedding_dir(rays_directions_normed)
+            output = self.color_layer((self.intermediate_linear(features), rays_embedding))
+        else:
+            output = self.color_layer(self.intermediate_linear(features))
 
-        return self.color_layer((self.intermediate_linear(features), rays_embedding))
+        return output
 
     def _get_densities_and_colors(
         self, features: torch.Tensor, ray_bundle: RayBundle, density_noise_std: float

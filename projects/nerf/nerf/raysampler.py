@@ -187,7 +187,7 @@ class NeRFRaysampler(torch.nn.Module):
         """
         return int(
             math.ceil(
-                (self._grid_raysampler._xy_grid.numel() * 0.5 * batch_size) / chunksize
+                (self._grid_raysampler._xy_grid.numel() * 0.5) / chunksize
             )
         )
 
@@ -309,7 +309,7 @@ class NeRFRaysampler(torch.nn.Module):
         batch_size = cameras.R.shape[0]  # pyre-ignore
         device = cameras.device
 
-        if (camera_hash is None) and (not caching) and self.training:
+        if (not caching) and self.training:
             # Sample random rays from scratch.
             ray_bundle = self._mc_raysampler(cameras)
             ray_bundle = self._normalize_raybundle(ray_bundle)
@@ -326,7 +326,7 @@ class NeRFRaysampler(torch.nn.Module):
                 full_ray_bundle = self._grid_raysampler(cameras)
                 full_ray_bundle = self._normalize_raybundle(full_ray_bundle)
 
-            n_pixels = full_ray_bundle.directions.shape[:-1].numel()
+            n_pixels = full_ray_bundle.directions.shape[:-1].numel() // batch_size  # image_height * image_width
 
             if self.training:
                 # During training we randomly subsample rays.
@@ -336,21 +336,20 @@ class NeRFRaysampler(torch.nn.Module):
             else:
                 # In case we test, we take only the requested chunk.
                 if chunksize is None:
-                    chunksize = n_pixels * batch_size
-                start = chunk_idx * chunksize * batch_size
+                    chunksize = n_pixels
+                start = chunk_idx * chunksize
                 end = min(start + chunksize, n_pixels)
                 sel_rays = torch.arange(
                     start,
                     end,
                     dtype=torch.long,
                     device=full_ray_bundle.lengths.device,
-                )
+                )  # numel() <= chunksize ; end <= n_pixels - 1
 
             # Take the "sel_rays" rays from the full ray bundle.
             ray_bundle = RayBundle(
                 *[
-                    v.view(n_pixels, -1)[sel_rays]
-                    .view(batch_size, sel_rays.numel() // batch_size, -1)
+                    v.reshape(batch_size, n_pixels, -1)[:, sel_rays]
                     .to(device)
                     for v in full_ray_bundle
                 ]

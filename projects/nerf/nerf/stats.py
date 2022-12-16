@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import colors as mcolors
 from visdom import Visdom
+from torch.utils.tensorboard import SummaryWriter
 
 
 class AverageMeter:
@@ -247,6 +248,7 @@ class Stats:
         viz: Visdom = None,
         visdom_env: Optional[str] = None,
         plot_file: Optional[str] = None,
+        writer: SummaryWriter = None
     ) -> None:
         """
         Plot the line charts of the history of the stats.
@@ -255,6 +257,7 @@ class Stats:
             viz: The Visdom object holding the connection to a Visdom server.
             visdom_env: The visdom environment for storing the graphs.
             plot_file: The path to a file with training plots.
+            writer: Tensorboard writer object.
         """
 
         stat_sets = list(self.stats.keys())
@@ -308,16 +311,17 @@ class Stats:
                         update=update,
                     )
 
+
         if plot_file is None:
             plot_file = self.plot_file
 
-        if plot_file is not None:
+        if plot_file is not None or writer is not None:
             print("Exporting stats to %s" % plot_file)
             ncol = 3
             nrow = int(np.ceil(float(len(lines)) / ncol))
-            matplotlib.rcParams.update({"font.size": 5})
+            matplotlib.rcParams.update({"font.size": 10})
             color = cycle(plt.cm.tab10(np.linspace(0, 1, 10)))
-            fig = plt.figure(1)
+            fig = plt.figure(1, figsize=(5*ncol, 5*nrow), dpi=100)
             plt.clf()
             for idx, (tmodes, stat, x, vals) in enumerate(lines):
                 c = next(color)
@@ -342,5 +346,8 @@ class Stats:
                 plt.minorticks_on()
 
             plt.tight_layout()
-            plt.show()
-            fig.savefig(plot_file)
+            if writer is not None:
+                writer.add_figure("Stats", fig, self.epoch)
+            if plot_file is not None:
+                plt.show()
+                fig.savefig(plot_file)

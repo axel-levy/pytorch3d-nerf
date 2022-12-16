@@ -23,6 +23,20 @@ def calc_psnr(x: torch.Tensor, y: torch.Tensor):
     return psnr
 
 
+def calc_replication_loss(x: torch.Tensor, y: torch.Tensor, replication_order: int):
+    """
+    x: [(replication_order * ) batch_size, ...]
+    y: [(replication_order * ) batch_size, ...]
+    """
+    replication_order_batch_size = x.shape[0]
+    batch_size = replication_order_batch_size // replication_order
+    y = y.reshape(replication_order, batch_size, -1)
+    x = x.reshape(replication_order, batch_size, -1)
+    square_errors = torch.mean((x - y) ** 2, dim=-1)
+    min_distances, activated_paths = torch.min(square_errors, 0)
+    return min_distances.mean(), activated_paths
+
+
 def sample_images_at_mc_locs(
     target_images: torch.Tensor,
     sampled_rays_xy: torch.Tensor,

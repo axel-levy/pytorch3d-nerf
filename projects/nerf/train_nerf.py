@@ -18,6 +18,7 @@ from nerf.nerf_renderer import RadianceFieldRenderer, visualize_nerf_outputs
 from nerf.stats import Stats
 from omegaconf import DictConfig
 from visdom import Visdom
+from torch.utils.tensorboard import SummaryWriter
 
 
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs")
@@ -39,6 +40,12 @@ def main(cfg):
         )
         device = "cpu"
 
+    # Load the training/validation data.
+    train_dataset, val_dataset, _ = get_nerf_datasets(
+        dataset_name=cfg.data.dataset_name,
+        image_size=cfg.data.image_size,
+    )
+
     # Initialize the Radiance Field model.
     model = RadianceFieldRenderer(
         image_size=cfg.data.image_size,
@@ -59,8 +66,14 @@ def main(cfg):
         depth_camera_predictor=cfg.camera_predictor.depth,
         channels_camera_predictor=cfg.camera_predictor.channels,
         kernel_size_camera_predictor=cfg.camera_predictor.kernel_size,
+        northern_hemisphere=cfg.camera_predictor.northern_hemisphere,
+        n_images=len(train_dataset),
         density_noise_std=cfg.implicit_function.density_noise_std,
         visualization=cfg.visualization.visdom,
+        view_dependency=cfg.implicit_function.view_dependency,
+        mask_loss=cfg.loss_function.mask_loss,
+        replication_loss=cfg.loss_function.replication_loss,
+        replication_order=cfg.loss_function.replication_order
     )
 
     # Move the model to the relevant device.
@@ -100,8 +113,11 @@ def main(cfg):
 
     # Init the stats object.
     if stats is None:
+        stat_list = ["loss", "mse_coarse", "mse_fine", "psnr_coarse", "psnr_fine", "sec/it"]
+        if cfg.loss_function.mask_loss:
+            stat_list += ["mse_mask_coarse", "mse_mask_fine"]
         stats = Stats(
-            ["loss", "mse_coarse", "mse_fine", "psnr_coarse", "psnr_fine", "sec/it"],
+            stat_list
         )
 
     # Learning rate scheduler setup.
@@ -131,11 +147,10 @@ def main(cfg):
     else:
         viz = None
 
-    # Load the training/validation data.
-    train_dataset, val_dataset, _ = get_nerf_datasets(
-        dataset_name=cfg.data.dataset_name,
-        image_size=cfg.data.image_size,
-    )
+    # Init tensorboard.
+    summary_dir = os.path.join(hydra.utils.get_original_cwd(), cfg.tensorboard.summary_dir)
+    os.makedirs(summary_dir, exist_ok=True)
+    writer = SummaryWriter(cfg.tensorboard.summary_dir)
 
     if cfg.data.precache_rays:
         # Precache the projection rays.
@@ -174,6 +189,7 @@ def main(cfg):
 
     print("Training starts now.")
     # Run the main training loop.
+    alignment = torch.eye(3, dtype=torch.float32, device=device)
     for epoch in range(start_epoch, cfg.optimizer.max_epochs):
         stats.new_epoch()  # Init a new epoch.
         for iteration, batch in enumerate(train_dataloader):
@@ -184,14 +200,17 @@ def main(cfg):
             optimizer.zero_grad()
 
             # Run the forward pass of the model.
-            nerf_out, metrics = model(
-                camera_idx if cfg.data.precache_rays else None,
+            nerf_out, metrics, camera_pred = model(
+                camera_idx if cfg.data.precache_rays or cfg.camera_predictor.type == 'pe' else None,
                 camera,
                 image,
             )
 
             # The loss is a sum of coarse and fine MSEs
             loss = metrics["mse_coarse"] + metrics["mse_fine"]
+
+            if cfg.loss_function.mask_loss:
+                loss += cfg.loss_function.mask_loss_weight * (metrics["mse_mask_coarse"] + metrics["mse_mask_fine"])
 
             # Take the training step.
             loss.backward()
@@ -200,7 +219,7 @@ def main(cfg):
             # Update stats with the current metrics.
             stats.update(
                 {"loss": float(loss), **metrics},
-                stat_set="train",
+                stat_set="train"
             )
 
             if iteration % cfg.stats_print_interval == 0:
@@ -211,6 +230,7 @@ def main(cfg):
                 visuals_cache.append(
                     {
                         "camera": camera.cpu(),
+                        "camera_pred": camera_pred.cpu(),
                         "camera_idx": camera_idx,
                         "image": image.cpu().detach(),
                         "rgb_fine": nerf_out["rgb_fine"].cpu().detach(),
@@ -235,10 +255,12 @@ def main(cfg):
             # Activate eval mode of the model (lets us do a full rendering pass).
             model.eval()
             with torch.no_grad():
-                val_nerf_out, val_metrics = model(
+                val_nerf_out, val_metrics, val_camera_pred = model(
                     camera_idx if cfg.data.precache_rays else None,
                     val_camera,
                     val_image,
+                    align_gt=True,
+                    alignment=alignment
                 )
 
             # Update stats with the validation metrics.
@@ -251,10 +273,11 @@ def main(cfg):
                     viz=viz,
                     visdom_env=cfg.visualization.visdom_env,
                     plot_file=None,
+                    writer=writer
                 )
                 # Visualize the intermediate results.
-                visualize_nerf_outputs(
-                    val_nerf_out, visuals_cache, viz, cfg.visualization.visdom_env
+                alignment = visualize_nerf_outputs(
+                    val_nerf_out, visuals_cache, viz, cfg.visualization.visdom_env, writer, epoch
                 )
 
             # Set the model back to train mode.

@@ -6,18 +6,21 @@
 
 from typing import List, Optional, Tuple
 
+import numpy as np
+import matplotlib.pyplot as plt
 import torch
 from pytorch3d.renderer import ImplicitRenderer, ray_bundle_to_ray_points
 from pytorch3d.renderer.cameras import CamerasBase
 from pytorch3d.structures import Pointclouds
 from pytorch3d.vis.plotly_vis import plot_scene
 from visdom import Visdom
+from torch.utils.tensorboard import SummaryWriter
 
 from .implicit_function import NeuralRadianceField
 from .raymarcher import EmissionAbsorptionNeRFRaymarcher
 from .raysampler import NeRFRaysampler, ProbabilisticRaysampler
-from .utils import calc_mse, calc_psnr, sample_images_at_mc_locs
-from .camera_predictor import AzimuthElevationCameraPredictor
+from .utils import calc_mse, calc_psnr, sample_images_at_mc_locs, calc_replication_loss
+from .camera_predictor import AzimuthElevationCameraPredictor, rotmat_to_2d_coords, align_rotation_set, select_paths, align_camera_gt, PEAzimuthElevationCameraPredictor
 
 
 class RadianceFieldRenderer(torch.nn.Module):
@@ -72,9 +75,15 @@ class RadianceFieldRenderer(torch.nn.Module):
         depth_camera_predictor: int = 4,
         channels_camera_predictor: int = 16,
         kernel_size_camera_predictor: int = 3,
+        northern_hemisphere: bool = False,
+        n_images: int = 100,
         append_xyz: Tuple[int, ...] = (5,),
         density_noise_std: float = 0.0,
         visualization: bool = False,
+        view_dependency: bool = True,
+        mask_loss: bool = False,
+        replication_loss: bool = False,
+        replication_order: int = 2
     ):
         """
         Args:
@@ -108,9 +117,11 @@ class RadianceFieldRenderer(torch.nn.Module):
             n_layers_xyz: The number of layers of the MLP that outputs the
                 occupancy field.
             camera_predictor_type: Type of camera predictor.
-            depth_camera_predictor: depth of camera predictor.
-            channels_camera_predictor: number of channels of camera predictor.
-            kernel_size_camera_predictor: kernel size of camera predictor.
+            depth_camera_predictor: Depth of camera predictor.
+            channels_camera_predictor: Number of channels of camera predictor.
+            kernel_size_camera_predictor: Kernel size of camera predictor.
+            northern_hemisphere: Whether to constrain the directions to the Northern hemisphere.
+            n_images: Number of images in the training dataset.
             append_xyz: The list of indices of the skip layers of the occupancy MLP.
                 Prior to evaluating the skip layers, the tensor which was input to MLP
                 is appended to the skip layer input.
@@ -118,6 +129,10 @@ class RadianceFieldRenderer(torch.nn.Module):
                 added to the output of the occupancy MLP.
                 Active only when `self.training==True`.
             visualization: whether to store extra output for visualization.
+            view_dependency: Whether the radiance field should be view-dependent.
+            mask_loss: Whether to compute the mask_loss.
+            replication_loss: Whether to use the replication loss.
+            replication_order: Replication order for the replication loss.
         """
 
         super().__init__()
@@ -170,8 +185,10 @@ class RadianceFieldRenderer(torch.nn.Module):
                 n_hidden_neurons_dir=n_hidden_neurons_dir,
                 n_layers_xyz=n_layers_xyz,
                 append_xyz=append_xyz,
+                view_dependency=view_dependency
             )
 
+        self.camera_predictor_type = camera_predictor_type
         if camera_predictor_type == 'gt':
             self.camera_predictor = None
         elif camera_predictor_type == 'cnn':
@@ -180,13 +197,26 @@ class RadianceFieldRenderer(torch.nn.Module):
                 image_height,
                 depth=depth_camera_predictor,
                 channels=channels_camera_predictor,
-                kernel_size=kernel_size_camera_predictor
+                kernel_size=kernel_size_camera_predictor,
+                replication_loss=replication_loss,
+                replication_order=replication_order,
+                northern_hemisphere=northern_hemisphere
+            )
+        elif camera_predictor_type == 'pe':
+            self.camera_predictor = PEAzimuthElevationCameraPredictor(
+                n_images,
+                replication_loss=replication_loss,
+                replication_order=replication_order,
+                northern_hemisphere=northern_hemisphere
             )
 
         self._density_noise_std = density_noise_std
         self._chunk_size_test = chunk_size_test
         self._image_size = image_size
         self.visualization = visualization
+        self.mask_loss = mask_loss
+        self.replication_loss = replication_loss
+        self.replication_order = replication_order
 
     def precache_rays(
         self,
@@ -218,7 +248,7 @@ class RadianceFieldRenderer(torch.nn.Module):
         camera_hash: Optional[str],
         camera: CamerasBase,
         image: torch.Tensor,
-        chunk_idx: int,
+        chunk_idx: int
     ) -> dict:
         """
         Samples and renders a chunk of rays.
@@ -263,20 +293,40 @@ class RadianceFieldRenderer(torch.nn.Module):
                 if image is not None:
                     # Sample the ground truth images at the xy locations of the
                     # rendering ray pixels.
+                    batch_size = camera.R.shape[0]
+                    image_sampled = torch.cat([image[..., :3]] * (batch_size // image.shape[0]), dim=0)
                     rgb_gt = sample_images_at_mc_locs(
-                        image[..., :3][None],
+                        image_sampled,
                         ray_bundle_out.xys,
                     )
+                    mask = (torch.norm(image_sampled, dim=-1) > 1e-6)[..., None].float()
+                    if self.mask_loss:
+                        opacity_gt = sample_images_at_mc_locs(
+                            mask,
+                            ray_bundle_out.xys,
+                        )[..., 0]
                 else:
                     rgb_gt = None
+                if self.mask_loss:
+                    opacity_coarse = weights.sum(dim=-1)
 
             elif renderer_pass == "fine":
                 rgb_fine = rgb
+                if self.mask_loss:
+                    opacity_fine = weights.sum(dim=-1)
 
             else:
                 raise ValueError(f"No such rendering pass {renderer_pass}")
 
-        out = {"rgb_fine": rgb_fine, "rgb_coarse": rgb_coarse, "rgb_gt": rgb_gt}
+        out = {
+            "rgb_fine": rgb_fine,
+            "rgb_coarse": rgb_coarse,
+            "rgb_gt": rgb_gt
+        }
+        if self.mask_loss:
+            out["opacity_fine"] = opacity_fine
+            out["opacity_coarse"] = opacity_coarse
+            out["opacity_gt"] = opacity_gt
         if self.visualization:
             # Store the coarse rays/weights only for visualization purposes.
             out["coarse_ray_bundle"] = type(coarse_ray_bundle)(
@@ -291,7 +341,9 @@ class RadianceFieldRenderer(torch.nn.Module):
         camera_hash: Optional[str],
         camera_gt: CamerasBase,
         image: torch.Tensor,
-    ) -> Tuple[dict, dict]:
+        align_gt: bool = False,
+        alignment: Optional[torch.Tensor] = None
+    ) -> Tuple[dict, dict, CamerasBase]:
         """
         Performs the coarse and fine rendering passes of the radiance field
         from the viewpoint of the input `camera`.
@@ -313,6 +365,8 @@ class RadianceFieldRenderer(torch.nn.Module):
             camera_gt: A batch of cameras from which the scene is rendered.
             image: A batch of corresponding ground truth images of shape
                 ('batch_size', ·, ·, 3).
+            align_gt: Whether to use the aligne gt cameras.
+            alignment: Alignment matrix.
         Returns:
             out: `dict` containing the outputs of the rendering:
                 `rgb_coarse`: The result of the coarse rendering pass.
@@ -338,20 +392,31 @@ class RadianceFieldRenderer(torch.nn.Module):
                 `psnr_fine`: Peak signal-to-noise ratio between the fine render and
                     the input `image`
         """
-        if not self.training:
-            # Full evaluation pass.
-            n_chunks = self._renderer["coarse"].raysampler.get_n_chunks(
-                self._chunk_size_test,
-                camera_gt.R.shape[0],
-            )
+        if image.dim() == 3:
+            image = image[None]
         else:
-            # MonteCarlo ray sampling.
-            n_chunks = 1
+            image = image
 
         if self.camera_predictor is None:
             camera = camera_gt
         else:
-            camera = self.camera_predictor(image, camera_gt)
+            if not align_gt:
+                if self.camera_predictor_type == 'cnn':
+                    camera = self.camera_predictor(image, camera_gt)
+                elif self.camera_predictor_type == 'pe':
+                    camera = self.camera_predictor(camera_hash, camera_gt)
+            else:
+                camera = align_camera_gt(camera_gt, alignment)
+
+        if not self.training:
+            # Full evaluation pass.
+            n_chunks = self._renderer["coarse"].raysampler.get_n_chunks(
+                self._chunk_size_test,
+                camera.R.shape[0],
+            )
+        else:
+            # MonteCarlo ray sampling.
+            n_chunks = 1
 
         # Process the chunks of rays.
         chunk_outputs = [
@@ -371,10 +436,13 @@ class RadianceFieldRenderer(torch.nn.Module):
                 k: torch.cat(
                     [ch_o[k] for ch_o in chunk_outputs],
                     dim=1,
-                ).view(-1, *self._image_size, 3)
+                ).view(-1, *self._image_size, channels)
                 if chunk_outputs[0][k] is not None
                 else None
-                for k in ("rgb_fine", "rgb_coarse", "rgb_gt")
+                for k, channels in zip(
+                    ("rgb_fine", "rgb_coarse", "rgb_gt", "opacity_fine", "opacity_coarse", "opacity_gt"),
+                    (3, 3, 3, 1, 1, 1)
+                )
             }
         else:
             out = chunk_outputs[0]
@@ -383,19 +451,64 @@ class RadianceFieldRenderer(torch.nn.Module):
         metrics = {}
         if image is not None:
             for render_pass in ("coarse", "fine"):
-                for metric_name, metric_fun in zip(
-                    ("mse", "psnr"), (calc_mse, calc_psnr)
-                ):
-                    metrics[f"{metric_name}_{render_pass}"] = metric_fun(
-                        out["rgb_" + render_pass][..., :3],
-                        out["rgb_gt"][..., :3],
+                if self.replication_loss and not align_gt:
+                    if render_pass == "coarse":
+                        metrics[f"mse_{render_pass}"], activated_paths = calc_replication_loss(
+                            out["rgb_" + render_pass][..., :3],
+                            out["rgb_gt"][..., :3],
+                            self.replication_order
+                        )
+                        selected_rgb_gt = select_paths(
+                            out["rgb_gt"][..., :3], activated_paths, self.replication_order
+                        )
+                        out["rgb_selected_gt"] = selected_rgb_gt
+                    selected_rgb = select_paths(
+                        out["rgb_" + render_pass][..., :3], activated_paths, self.replication_order
                     )
+                    out["rgb_selected_" + render_pass] = selected_rgb
+                    if render_pass == "fine":
+                        metrics[f"mse_{render_pass}"] = calc_mse(
+                            out["rgb_selected_" + render_pass][..., :3],
+                            out["rgb_selected_gt"][..., :3],
+                        )
+                    metrics[f"psnr_{render_pass}"] = calc_psnr(
+                        selected_rgb,
+                        selected_rgb_gt
+                    )
+                    if self.mask_loss:
+                        # the model uses the paths founds for the photometric loss on the coarse model
+                        selected_opacity = select_paths(
+                            out["opacity_" + render_pass], activated_paths, self.replication_order
+                        )
+                        selected_opacity_gt = select_paths(
+                            out["opacity_gt"], activated_paths, self.replication_order
+                        )
+                        metrics[f"mse_mask_{render_pass}"] = calc_mse(
+                            selected_opacity,
+                            selected_opacity_gt
+                        )
+                else:
+                    for metric_name, metric_fun in zip(
+                        ("mse", "psnr"), (calc_mse, calc_psnr)
+                    ):
+                        metrics[f"{metric_name}_{render_pass}"] = metric_fun(
+                            out["rgb_" + render_pass][..., :3],
+                            out["rgb_gt"][..., :3],
+                        )
+                    if self.mask_loss:
+                        metrics[f"mse_mask_{render_pass}"] = calc_mse(
+                            out["opacity_" + render_pass],
+                            out["opacity_gt"]
+                        )
+            if self.replication_loss and not align_gt:
+                batch_size = camera_gt.R.shape[0]
+                camera = camera[activated_paths.cpu() * batch_size + torch.arange(batch_size)]
 
-        return out, metrics
+        return out, metrics, camera
 
 
 def visualize_nerf_outputs(
-    nerf_out: dict, output_cache: List, viz: Visdom, visdom_env: str
+        nerf_out: dict, output_cache: List, viz: Visdom, visdom_env: str, writer: SummaryWriter, steps: int
 ):
     """
     Visualizes the outputs of the `RadianceFieldRenderer`.
@@ -405,6 +518,8 @@ def visualize_nerf_outputs(
         output_cache: A list with outputs of several training render passes.
         viz: A visdom connection object.
         visdom_env: The name of visdom environment for visualization.
+        writer: A tensorboard writer object.
+        steps: Number of steps.
     """
 
     # Show the training images.
@@ -416,6 +531,7 @@ def visualize_nerf_outputs(
         win="images",
         opts={"title": "train_images"},
     )
+    writer.add_image("Train Images", ims.permute(2, 0, 1), steps)
 
     # Show the coarse and fine renders together with the ground truth images.
     ims_full = torch.cat(
@@ -431,10 +547,11 @@ def visualize_nerf_outputs(
         win="images_full",
         opts={"title": "coarse | fine | target"},
     )
+    writer.add_image("Coarse | Fine | Target", ims_full, steps)
 
     # Make a 3D plot of training cameras and their emitted rays.
     camera_trace = {
-        f"camera_{ci:03d}": o["camera"].cpu() for ci, o in enumerate(output_cache)
+        f"camera_{ci:03d}": o["camera_pred"].cpu() for ci, o in enumerate(output_cache)
     }
     ray_pts_trace = {
         f"ray_pts_{ci:03d}": Pointclouds(
@@ -457,3 +574,30 @@ def visualize_nerf_outputs(
         camera_scale=0.3,
     )
     viz.plotlyplot(plotly_plot, env=visdom_env, win="scenes")
+
+    # Tensorboard.
+
+    # View directions.
+    rotmat_gt = torch.cat([o["camera"].R for o in output_cache], 0)
+    rotmat_pred = torch.cat([o["camera_pred"].R for o in output_cache], 0)
+    alignment, rotmat_pred_aligned = align_rotation_set(rotmat_gt, rotmat_pred)
+    xy_gt = rotmat_to_2d_coords(rotmat_gt)
+    xy_pred_aligned = rotmat_to_2d_coords(rotmat_pred_aligned)
+    xy_gt = xy_gt.cpu().detach().numpy()
+    xy_pred_aligned = xy_pred_aligned.cpu().detach().numpy()
+
+    fig = plt.figure(figsize=(6, 6), dpi=100)
+    plt.plot(xy_gt[..., 0], xy_gt[..., 1], 'ro', label='gt')
+    plt.plot(xy_pred_aligned[..., 0], xy_pred_aligned[..., 1], 'bo', label='pred (aligned)')
+    for i in range(len(xy_gt)):
+        plt.plot([xy_gt[i, 0], xy_pred_aligned[i, 0]], [xy_gt[i, 1], xy_pred_aligned[i, 1]], 'k--')
+    theta = np.linspace(0.0, 2.0 * np.pi, 100)
+    plt.plot((np.pi / 2.0) * np.cos(theta), (np.pi / 2.0) * np.sin(theta), '--', color='grey')
+    plt.grid(True)
+    plt.legend(loc="best")
+    plt.axis('equal')
+    plt.xlim(-2, 2)
+    plt.ylim(-2, 2)
+    writer.add_figure("View Directions (GT Frame)", fig, global_step=steps)
+
+    return alignment
