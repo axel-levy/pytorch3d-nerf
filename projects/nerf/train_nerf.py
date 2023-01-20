@@ -44,6 +44,8 @@ def main(cfg):
     train_dataset, val_dataset, _ = get_nerf_datasets(
         dataset_name=cfg.data.dataset_name,
         image_size=cfg.data.image_size,
+        contains_masks=cfg.data.contains_masks,
+        apply_mask=cfg.data.apply_mask
     )
 
     # Initialize the Radiance Field model.
@@ -67,13 +69,16 @@ def main(cfg):
         channels_camera_predictor=cfg.camera_predictor.channels,
         kernel_size_camera_predictor=cfg.camera_predictor.kernel_size,
         northern_hemisphere=cfg.camera_predictor.northern_hemisphere,
+        no_elevation=cfg.camera_predictor.no_elevation,
+        use_gt_in_planes=cfg.camera_predictor.use_gt_in_planes,
         n_images=len(train_dataset),
         density_noise_std=cfg.implicit_function.density_noise_std,
         visualization=cfg.visualization.visdom,
         view_dependency=cfg.implicit_function.view_dependency,
         mask_loss=cfg.loss_function.mask_loss,
         replication_loss=cfg.loss_function.replication_loss,
-        replication_order=cfg.loss_function.replication_order
+        replication_order=cfg.loss_function.replication_order,
+        n_noisy_epochs=cfg.camera_predictor.n_noisy_epochs
     )
 
     # Move the model to the relevant device.
@@ -195,6 +200,7 @@ def main(cfg):
         for iteration, batch in enumerate(train_dataloader):
             image, mask, camera, camera_idx = batch[0].values()
             image = image.to(device)
+            mask = mask.to(device)
             camera = camera.to(device)
 
             optimizer.zero_grad()
@@ -204,6 +210,8 @@ def main(cfg):
                 camera_idx if cfg.data.precache_rays or cfg.camera_predictor.type == 'pe' else None,
                 camera,
                 image,
+                mask,
+                epoch=epoch
             )
 
             # The loss is a sum of coarse and fine MSEs
@@ -250,6 +258,7 @@ def main(cfg):
             val_batch = next(val_dataloader.__iter__())
             val_image, val_mask, val_camera, camera_idx = val_batch[0].values()
             val_image = val_image.to(device)
+            val_mask = val_mask.to(device)
             val_camera = val_camera.to(device)
 
             # Activate eval mode of the model (lets us do a full rendering pass).
@@ -259,6 +268,7 @@ def main(cfg):
                     camera_idx if cfg.data.precache_rays else None,
                     val_camera,
                     val_image,
+                    val_mask,
                     align_gt=True,
                     alignment=alignment
                 )

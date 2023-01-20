@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Union
+from typing import Union, Optional
 import numpy as np
 
 from pytorch3d.renderer.cameras import PerspectiveCameras
@@ -97,6 +97,46 @@ def direction_to_rotmat(
     x = left / torch.norm(left, dim=-1, keepdim=True)
     y = torch.cross(z, x, dim=-1)
     return torch.cat([x[..., None], y[..., None], z[..., None]], -1)
+
+
+def rotmat_to_in_plane(
+        rotmat: torch.Tensor
+) -> torch.Tensor:
+    """
+    rotmat: [batch_size, 3, 3]
+
+    output: [batch_size]
+    """
+    batch_size = rotmat.shape[0]
+    x = rotmat[:, :, 0]
+    y = rotmat[:, :, 1]
+    z = rotmat[:, :, 2]
+    up = torch.tensor([0., 0., 1.], dtype=torch.float32, device=rotmat.device)[None].repeat(batch_size, 1)
+    x_aligned = torch.cross(up, z, dim=-1)
+    x_aligned /= torch.norm(x_aligned, dim=-1, keepdim=True)
+    h = torch.sum(x * x_aligned, dim=-1)
+    v = torch.sum(y * x_aligned, dim=-1)
+    in_plane = torch.atan2(v, h)
+    return in_plane
+
+
+def apply_in_plane(
+        rotmat: torch.Tensor,
+        in_plane: torch.Tensor
+) -> torch.Tensor:
+    """
+    rotmat: [batch_size, 3, 3]
+    in_plane: [batch_size]
+
+    output: [batch_size, 3, 3]
+    """
+    correction_matrix = torch.cat([
+        torch.cos(in_plane)[..., None], -torch.sin(in_plane)[..., None], torch.zeros_like(in_plane)[..., None],
+        torch.sin(in_plane)[..., None], torch.cos(in_plane)[..., None], torch.zeros_like(in_plane)[..., None],
+        torch.zeros_like(in_plane)[..., None], torch.zeros_like(in_plane)[..., None],
+        torch.ones_like(in_plane)[..., None]
+    ], -1).reshape(-1, 3, 3)
+    return torch.sum(rotmat[..., None] * correction_matrix.permute(0, 2, 1)[:, None], dim=2)
 
 
 def rotmat_to_direction(
@@ -200,18 +240,43 @@ def latents_to_direction(
     return latents / torch.norm(latents, dim=-1, keepdim=True)
 
 
+def fix_elevation(
+        direction: torch.Tensor,
+        fixed_elevation: float
+) -> torch.Tensor:
+    """
+    direction: [batch_size, 3]
+    fixed_elevation: float
+
+    output: [batch_size, 3]
+    """
+    azimuth, _ = direction_to_azimuth_elevation(direction)
+    elevation = torch.ones_like(azimuth) * fixed_elevation
+    return azimuth_elevation_to_direction(azimuth, elevation)
+
+
 def direction_to_camera(
         direction: torch.Tensor,
         camera_gt: PerspectiveCameras,
         replication_loss: bool,
         replication_order: int,
-        northern_hemisphere: bool
+        northern_hemisphere: bool,
+        no_elevation: bool = False,
+        use_gt_in_planes: bool = False
 ) -> PerspectiveCameras:
     if northern_hemisphere:
         direction = constrain_north(direction)
+    if no_elevation:
+        # fixed_elevation = np.arctan(0.5 / 4.0)
+        fixed_elevation = 0.0
+        direction = fix_elevation(direction, fixed_elevation)
     if replication_loss:
         direction_replicated = replicate_direction(direction, replication_order)
         rotmat = direction_to_rotmat(direction_replicated)
+        if use_gt_in_planes:
+            in_plane = rotmat_to_in_plane(camera_gt.R)
+            in_plane = torch.cat([in_plane] * replication_order, dim=0)
+            rotmat = apply_in_plane(rotmat, in_plane)
         camera_pred = PerspectiveCameras(
             focal_length=torch.cat([camera_gt.focal_length] * replication_order, dim=0),
             principal_point=torch.cat([camera_gt.principal_point] * replication_order, dim=0),
@@ -221,6 +286,9 @@ def direction_to_camera(
     else:
         rotmat = direction_to_rotmat(direction)
         camera_pred = camera_gt.clone()
+        if use_gt_in_planes:
+            in_plane = rotmat_to_in_plane(camera_gt.R)
+            rotmat = apply_in_plane(rotmat, in_plane)
         camera_pred.R = rotmat
     return camera_pred
 
@@ -262,7 +330,10 @@ class AzimuthElevationCameraPredictor(nn.Module):
             kernel_size: int,
             replication_loss: bool = False,
             replication_order: int = 2,
-            northern_hemisphere: bool = False
+            northern_hemisphere: bool = False,
+            no_elevation: bool = False,
+            n_noisy_epochs: int = 0,
+            use_gt_in_planes: bool = False
     ) -> None:
         super(AzimuthElevationCameraPredictor, self).__init__()
 
@@ -270,15 +341,25 @@ class AzimuthElevationCameraPredictor(nn.Module):
         self.replication_loss = replication_loss
         self.replication_order = replication_order
         self.northern_hemisphere = northern_hemisphere
+        self.no_elevation = no_elevation
+        self.n_noisy_epochs = n_noisy_epochs
+        self.use_gt_in_planes = use_gt_in_planes
 
     def forward(
             self,
             image: torch.Tensor,
-            camera_gt: PerspectiveCameras
+            camera_gt: PerspectiveCameras,
+            epoch: Optional[int] = None
     ) -> PerspectiveCameras:
-        direction = latents_to_direction(self.cnn(image))
+        if epoch is not None and epoch < self.n_noisy_epochs:
+            batch_size = image.shape[0]
+            direction = latents_to_direction(
+                torch.tensor(np.random.randn(batch_size, 3)).float().to(image.device))
+        else:
+            direction = latents_to_direction(self.cnn(image))
         return direction_to_camera(
-            direction, camera_gt, self.replication_loss, self.replication_order, self.northern_hemisphere
+            direction, camera_gt, self.replication_loss, self.replication_order, self.northern_hemisphere,
+            no_elevation=self.no_elevation, use_gt_in_planes=self.use_gt_in_planes
         )
 
 

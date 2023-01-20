@@ -8,6 +8,7 @@ data:
   dataset_name: 'lego'
   image_size: [128, 128] # [height, width]
   precache_rays: False
+  contains_masks: False
 test:
   mode: 'evaluation'
   trajectory_type: 'circular'
@@ -45,15 +46,18 @@ implicit_function:
   n_layers_xyz: 8
   view_dependency: True
 camera_predictor:
-  type: 'gt'
+  type: 'cnn'
   depth: 4
   channels: 16
   kernel_size: 3
   northern_hemisphere: True
+  no_elevation: False
+  n_noisy_epochs: 0
+  use_gt_in_planes: False
 tensorboard:
-  summary_dir: 'logs/test/lego_gt_000'
+  summary_dir: 'logs/ethiopian_00/lego_005'
 loss_function:
   mask_loss: True
   mask_loss_weight: 1.0
-  replication_loss: False
+  replication_loss: True
   replication_order: 2

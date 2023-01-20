@@ -57,6 +57,8 @@ def get_nerf_datasets(
     image_size: Tuple[int, int],
     data_root: str = DEFAULT_DATA_ROOT,
     autodownload: bool = True,
+    contains_masks: bool = False,
+    apply_mask: bool = False
 ) -> Tuple[Dataset, Dataset, Dataset]:
     """
     Obtains the training and validation dataset object for a dataset specified
@@ -67,6 +69,8 @@ def get_nerf_datasets(
         image_size: A tuple (height, width) denoting the sizes of the loaded dataset images.
         data_root: The root folder at which the data is stored.
         autodownload: Auto-download the dataset files in case they are missing.
+        contains_masks: Whether the dataset contains an alpha channel.
+        apply_mask: Whether to apply the mask on input images.
 
     Returns:
         train_dataset: The training dataset object.
@@ -74,8 +78,8 @@ def get_nerf_datasets(
         test_dataset: The testing dataset object.
     """
 
-    if dataset_name not in ALL_DATASETS:
-        raise ValueError(f"'{dataset_name}'' does not refer to a known dataset.")
+    # if dataset_name not in ALL_DATASETS:
+    #     raise ValueError(f"'{dataset_name}' does not refer to a known dataset.")
 
     print(f"Loading dataset {dataset_name}, image size={str(image_size)} ...")
 
@@ -92,17 +96,20 @@ def get_nerf_datasets(
     print("Loading images...")
     _image_max_image_pixels = Image.MAX_IMAGE_PIXELS
     Image.MAX_IMAGE_PIXELS = None  # The dataset image is very large ...
-    images = torch.FloatTensor(np.array(Image.open(image_path))) / 255.0
-    images = torch.stack(torch.chunk(images, n_cameras, dim=0))[..., :3]
+    images_rgba = torch.FloatTensor(np.array(Image.open(image_path))) / 255.0
+    images_rgba = torch.stack(torch.chunk(images_rgba, n_cameras, dim=0))[..., :4]
     Image.MAX_IMAGE_PIXELS = _image_max_image_pixels
     print("Done loading.")
 
-    scale_factors = [s_new / s for s, s_new in zip(images.shape[1:3], image_size)]
+    print(images_rgba.shape)
+    scale_factors = [s_new / s for s, s_new in zip(images_rgba.shape[1:3], image_size)]
     if abs(scale_factors[0] - scale_factors[1]) > 1e-3:
         raise ValueError(
             "Non-isotropic scaling is not allowed. Consider changing the 'image_size' argument."
         )
     scale_factor = sum(scale_factors) * 0.5
+
+    images = images_rgba[..., :3]
 
     if scale_factor != 1.0:
         print(f"Rescaling dataset (factor={scale_factor})")
@@ -112,7 +119,21 @@ def get_nerf_datasets(
             mode="bilinear",
         ).permute(0, 2, 3, 1)
 
-    masks = (torch.norm(images, dim=-1) > 1e-6)
+    if contains_masks:
+        alpha_channel = images_rgba[..., 3:]
+        if scale_factor != 1.0:
+            print(f"Rescaling dataset (factor={scale_factor})")
+            alpha_channel = torch.nn.functional.interpolate(
+                alpha_channel.permute(0, 3, 1, 2),
+                size=tuple(image_size),
+                mode="nearest",
+            ).permute(0, 2, 3, 1)
+        masks = (torch.norm(alpha_channel, dim=-1) > 0.5)
+        if apply_mask:
+            images *= masks[..., None].float()
+    else:
+        masks = (torch.norm(images, dim=-1) > 1e-6)
+        # images[~masks, :] = 1.0
 
     cameras = [
         PerspectiveCameras(

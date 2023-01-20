@@ -76,6 +76,8 @@ class RadianceFieldRenderer(torch.nn.Module):
         channels_camera_predictor: int = 16,
         kernel_size_camera_predictor: int = 3,
         northern_hemisphere: bool = False,
+        no_elevation: bool = False,
+        use_gt_in_planes: bool = False,
         n_images: int = 100,
         append_xyz: Tuple[int, ...] = (5,),
         density_noise_std: float = 0.0,
@@ -83,7 +85,8 @@ class RadianceFieldRenderer(torch.nn.Module):
         view_dependency: bool = True,
         mask_loss: bool = False,
         replication_loss: bool = False,
-        replication_order: int = 2
+        replication_order: int = 2,
+        n_noisy_epochs: int = 0
     ):
         """
         Args:
@@ -121,6 +124,8 @@ class RadianceFieldRenderer(torch.nn.Module):
             channels_camera_predictor: Number of channels of camera predictor.
             kernel_size_camera_predictor: Kernel size of camera predictor.
             northern_hemisphere: Whether to constrain the directions to the Northern hemisphere.
+            no_elevation: Whether to remove elevation prediction.
+            use_gt_in_planes: Use ground truth in-plane angles.
             n_images: Number of images in the training dataset.
             append_xyz: The list of indices of the skip layers of the occupancy MLP.
                 Prior to evaluating the skip layers, the tensor which was input to MLP
@@ -133,6 +138,7 @@ class RadianceFieldRenderer(torch.nn.Module):
             mask_loss: Whether to compute the mask_loss.
             replication_loss: Whether to use the replication loss.
             replication_order: Replication order for the replication loss.
+            n_noisy_epochs: Number of epochs where directions are replaced with noise (cnn only)
         """
 
         super().__init__()
@@ -200,7 +206,10 @@ class RadianceFieldRenderer(torch.nn.Module):
                 kernel_size=kernel_size_camera_predictor,
                 replication_loss=replication_loss,
                 replication_order=replication_order,
-                northern_hemisphere=northern_hemisphere
+                northern_hemisphere=northern_hemisphere,
+                no_elevation=no_elevation,
+                n_noisy_epochs=n_noisy_epochs,
+                use_gt_in_planes=use_gt_in_planes
             )
         elif camera_predictor_type == 'pe':
             self.camera_predictor = PEAzimuthElevationCameraPredictor(
@@ -248,6 +257,7 @@ class RadianceFieldRenderer(torch.nn.Module):
         camera_hash: Optional[str],
         camera: CamerasBase,
         image: torch.Tensor,
+        mask_bool: torch.Tensor,
         chunk_idx: int
     ) -> dict:
         """
@@ -260,6 +270,7 @@ class RadianceFieldRenderer(torch.nn.Module):
             camera: A batch of cameras from which the scene is rendered.
             image: A batch of corresponding ground truth images of shape
                 ('batch_size', ·, ·, 3).
+            mask_bool: A batch of masks.
             chunk_idx: The index of the currently rendered ray chunk.
         Returns:
             out: `dict` containing the outputs of the rendering:
@@ -299,12 +310,15 @@ class RadianceFieldRenderer(torch.nn.Module):
                         image_sampled,
                         ray_bundle_out.xys,
                     )
-                    mask = (torch.norm(image_sampled, dim=-1) > 1e-6)[..., None].float()
+                    mask = torch.cat([mask_bool[..., None].float()] * (batch_size // mask_bool.shape[0]), dim=0)
+                    # mask = (torch.norm(image_sampled, dim=-1) > 1e-6)[..., None].float()
+                    # mask = (torch.norm(image_sampled, dim=-1) < (np.sqrt(3.0) - 1e-3))[..., None].float()
                     if self.mask_loss:
                         opacity_gt = sample_images_at_mc_locs(
                             mask,
                             ray_bundle_out.xys,
                         )[..., 0]
+                    # opacity_gt = torch.ones_like(rgb_gt)[..., 0]
                 else:
                     rgb_gt = None
                 if self.mask_loss:
@@ -317,6 +331,14 @@ class RadianceFieldRenderer(torch.nn.Module):
 
             else:
                 raise ValueError(f"No such rendering pass {renderer_pass}")
+
+        # # Do not supervise rgb outside of the gt mask + set rgb to 0
+        rgb_coarse[(opacity_gt < 0.5), :] = 0.0
+        rgb_fine[(opacity_gt < 0.5), :] = 0.0
+        rgb_gt[(opacity_gt < 0.5), :] = 0.0
+
+        # Supervise rgb outside of the gt mask + set rgb to 0
+        # rgb_gt[(opacity_gt < 0.5), :] = 0.0
 
         out = {
             "rgb_fine": rgb_fine,
@@ -341,8 +363,10 @@ class RadianceFieldRenderer(torch.nn.Module):
         camera_hash: Optional[str],
         camera_gt: CamerasBase,
         image: torch.Tensor,
+        mask: torch.Tensor,
         align_gt: bool = False,
-        alignment: Optional[torch.Tensor] = None
+        alignment: Optional[torch.Tensor] = None,
+        epoch: Optional[int] = None
     ) -> Tuple[dict, dict, CamerasBase]:
         """
         Performs the coarse and fine rendering passes of the radiance field
@@ -365,8 +389,10 @@ class RadianceFieldRenderer(torch.nn.Module):
             camera_gt: A batch of cameras from which the scene is rendered.
             image: A batch of corresponding ground truth images of shape
                 ('batch_size', ·, ·, 3).
-            align_gt: Whether to use the aligne gt cameras.
+            mask: A batch of masks.
+            align_gt: Whether to use the aligned gt cameras.
             alignment: Alignment matrix.
+            epoch: Number of training epochs.
         Returns:
             out: `dict` containing the outputs of the rendering:
                 `rgb_coarse`: The result of the coarse rendering pass.
@@ -394,15 +420,15 @@ class RadianceFieldRenderer(torch.nn.Module):
         """
         if image.dim() == 3:
             image = image[None]
-        else:
-            image = image
+        if mask.dim() == 2:
+            mask = mask[None]
 
         if self.camera_predictor is None:
             camera = camera_gt
         else:
             if not align_gt:
                 if self.camera_predictor_type == 'cnn':
-                    camera = self.camera_predictor(image, camera_gt)
+                    camera = self.camera_predictor(image, camera_gt, epoch=epoch)
                 elif self.camera_predictor_type == 'pe':
                     camera = self.camera_predictor(camera_hash, camera_gt)
             else:
@@ -424,6 +450,7 @@ class RadianceFieldRenderer(torch.nn.Module):
                 camera_hash,
                 camera,
                 image,
+                mask,
                 chunk_idx,
             )
             for chunk_idx in range(n_chunks)
