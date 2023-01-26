@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Union, Optional
 import numpy as np
+from vit_pytorch import ViT
 
 from pytorch3d.renderer.cameras import PerspectiveCameras
 
@@ -17,7 +18,8 @@ class CNN(nn.Module):
     ) -> None:
         super(CNN, self).__init__()
 
-        nl = nn.ReLU
+        # nl = nn.ReLU
+        nl = nn.SiLU
         cnn = []
         in_channels = 3
         out_channels = channels
@@ -25,14 +27,18 @@ class CNN(nn.Module):
         for _ in range(depth):
             cnn.append(nn.Conv2d(in_channels, out_channels, kernel_size, padding='same'))
             in_channels = out_channels
-            cnn.append(nl())
-            out_channels = 2 * in_channels
-            cnn.append(nn.Conv2d(in_channels, out_channels, kernel_size, padding='same'))
-            in_channels = out_channels
-            cnn.append(nl())
-            cnn.append(nn.AvgPool2d(2))
-            final_size = final_size // 2
+            # cnn.append(nl())
+            # out_channels = 2 * in_channels
+            # cnn.append(nn.Conv2d(in_channels, out_channels, kernel_size, padding='same'))
+            # in_channels = out_channels
+            # cnn.append(nl())
+            # cnn.append(nn.AvgPool2d(2))
+            # final_size = final_size // 2
+            # cnn.append(nn.GroupNorm(channels, in_channels))
             cnn.append(nn.GroupNorm(channels, in_channels))
+            cnn.append(nl())
+            cnn.append(nn.MaxPool2d(2))
+            final_size = final_size // 2
         cnn.append(nn.Conv2d(in_channels, out_dim, final_size, padding='valid'))
         self.cnn = nn.Sequential(*cnn)
         self.out_dim = out_dim
@@ -194,6 +200,19 @@ def align(
     return alignment, norm
 
 
+def directions_to_out_of_planes(
+        direction_1: torch.Tensor,
+        direction_2: torch.Tensor
+) -> torch.Tensor:
+    """
+    direction_1: [batch_size, 3]
+    direction_2: [batch_size, 3]
+
+    output: [batch_size], out-of-plane angles in rad.
+    """
+    return torch.arccos(torch.clamp(torch.sum(direction_1 * direction_2, -1), min=-1.0, max=1.0))
+
+
 def align_rotation_set(
         rotmat_ref: torch.Tensor,
         rotmat_rot: torch.Tensor,
@@ -204,7 +223,7 @@ def align_rotation_set(
     rotmat_rot: [batch_size, 3, 3]
     n_max: int
 
-    output: [3, 3], [batch_size, 3, 3] alignment and rotmat_aligned = alignment @ rotmat_rot ~ rotmat_ref
+    output: [3, 3], [batch_size, 3, 3] and rotmat_aligned = alignment @ rotmat_rot ~ rotmat_ref
     """
     batch_size = rotmat_ref.shape[0]
     n_iter = np.min([batch_size, n_max])
@@ -216,7 +235,12 @@ def align_rotation_set(
             min_norm = norm
             best_alignment = alignment
     rotmat_aligned = best_alignment @ rotmat_rot
-    return best_alignment, rotmat_aligned
+    direction_ref = rotmat_to_direction(rotmat_ref)
+    direction_aligned = rotmat_to_direction(rotmat_aligned)
+    out_of_planes = directions_to_out_of_planes(direction_ref, direction_aligned)
+    mse_oop_deg = torch.mean(out_of_planes) * 180. / np.pi
+    medse_oop_deg = torch.median(out_of_planes) * 180. / np.pi
+    return best_alignment, rotmat_aligned, mse_oop_deg, medse_oop_deg
 
 
 def align_camera_gt(
@@ -333,11 +357,24 @@ class AzimuthElevationCameraPredictor(nn.Module):
             northern_hemisphere: bool = False,
             no_elevation: bool = False,
             n_noisy_epochs: int = 0,
-            use_gt_in_planes: bool = False
+            use_gt_in_planes: bool = False,
+            transformer: bool = False
     ) -> None:
         super(AzimuthElevationCameraPredictor, self).__init__()
 
-        self.cnn = CNN(resolution, depth, channels, kernel_size, out_dim=3)
+        self.transformer = transformer
+        if not transformer:
+            self.cnn = CNN(resolution, depth, channels, kernel_size, out_dim=3)
+        else:
+            self.vit = ViT(
+                image_size=resolution,
+                patch_size=resolution // 16,
+                num_classes=3,
+                dim=256,
+                depth=6,
+                heads=16,
+                mlp_dim=256
+            )
         self.replication_loss = replication_loss
         self.replication_order = replication_order
         self.northern_hemisphere = northern_hemisphere
@@ -356,7 +393,10 @@ class AzimuthElevationCameraPredictor(nn.Module):
             direction = latents_to_direction(
                 torch.tensor(np.random.randn(batch_size, 3)).float().to(image.device))
         else:
-            direction = latents_to_direction(self.cnn(image))
+            if not self.transformer:
+                direction = latents_to_direction(self.cnn(image))
+            else:
+                direction = latents_to_direction(self.vit(image.permute(0, 3, 1, 2)))
         return direction_to_camera(
             direction, camera_gt, self.replication_loss, self.replication_order, self.northern_hemisphere,
             no_elevation=self.no_elevation, use_gt_in_planes=self.use_gt_in_planes

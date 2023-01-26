@@ -348,6 +348,10 @@ class Stats:
             plt.tight_layout()
             if writer is not None:
                 writer.add_figure("Stats", fig, self.epoch)
+                for idx, (tmodes, stat, x, vals) in enumerate(lines):
+                    writer.add_scalar(f"{stat}/train", vals[-1, 0], self.epoch)
+                    if vals.shape[1] == 2:
+                        writer.add_scalar(f"{stat}/test", vals[-1, 1], self.epoch)
             if plot_file is not None:
                 plt.show()
                 fig.savefig(plot_file)

@@ -71,6 +71,7 @@ def main(cfg):
         northern_hemisphere=cfg.camera_predictor.northern_hemisphere,
         no_elevation=cfg.camera_predictor.no_elevation,
         use_gt_in_planes=cfg.camera_predictor.use_gt_in_planes,
+        transformer=cfg.camera_predictor.transformer,
         n_images=len(train_dataset),
         density_noise_std=cfg.implicit_function.density_noise_std,
         visualization=cfg.visualization.visdom,
@@ -78,7 +79,9 @@ def main(cfg):
         mask_loss=cfg.loss_function.mask_loss,
         replication_loss=cfg.loss_function.replication_loss,
         replication_order=cfg.loss_function.replication_order,
-        n_noisy_epochs=cfg.camera_predictor.n_noisy_epochs
+        n_noisy_epochs=cfg.camera_predictor.n_noisy_epochs,
+        n_epochs_mean=cfg.loss_function.n_epochs_mean,
+        epochs_coarse_only=cfg.loss_function.epochs_coarse_only
     )
 
     # Move the model to the relevant device.

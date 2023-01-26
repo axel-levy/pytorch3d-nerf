@@ -19,7 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 from .implicit_function import NeuralRadianceField
 from .raymarcher import EmissionAbsorptionNeRFRaymarcher
 from .raysampler import NeRFRaysampler, ProbabilisticRaysampler
-from .utils import calc_mse, calc_psnr, sample_images_at_mc_locs, calc_replication_loss
+from .utils import calc_mse, calc_psnr, sample_images_at_mc_locs, calc_replication_loss, mix_paths
 from .camera_predictor import AzimuthElevationCameraPredictor, rotmat_to_2d_coords, align_rotation_set, select_paths, align_camera_gt, PEAzimuthElevationCameraPredictor
 
 
@@ -78,6 +78,7 @@ class RadianceFieldRenderer(torch.nn.Module):
         northern_hemisphere: bool = False,
         no_elevation: bool = False,
         use_gt_in_planes: bool = False,
+        transformer: bool = False,
         n_images: int = 100,
         append_xyz: Tuple[int, ...] = (5,),
         density_noise_std: float = 0.0,
@@ -86,7 +87,9 @@ class RadianceFieldRenderer(torch.nn.Module):
         mask_loss: bool = False,
         replication_loss: bool = False,
         replication_order: int = 2,
-        n_noisy_epochs: int = 0
+        n_noisy_epochs: int = 0,
+        n_epochs_mean: int = 0,
+        epochs_coarse_only: int = 0
     ):
         """
         Args:
@@ -126,6 +129,7 @@ class RadianceFieldRenderer(torch.nn.Module):
             northern_hemisphere: Whether to constrain the directions to the Northern hemisphere.
             no_elevation: Whether to remove elevation prediction.
             use_gt_in_planes: Use ground truth in-plane angles.
+            transformer: Whether to replace the CNN with a vision transformer.
             n_images: Number of images in the training dataset.
             append_xyz: The list of indices of the skip layers of the occupancy MLP.
                 Prior to evaluating the skip layers, the tensor which was input to MLP
@@ -138,7 +142,9 @@ class RadianceFieldRenderer(torch.nn.Module):
             mask_loss: Whether to compute the mask_loss.
             replication_loss: Whether to use the replication loss.
             replication_order: Replication order for the replication loss.
-            n_noisy_epochs: Number of epochs where directions are replaced with noise (cnn only)
+            n_noisy_epochs: Number of epochs where directions are replaced with noise (cnn only).
+            n_epochs_mean: Number of epochs replicating loss is replaced with mean.
+            epochs_coarse_only: Number of epochs for coarse-only training.
         """
 
         super().__init__()
@@ -209,7 +215,8 @@ class RadianceFieldRenderer(torch.nn.Module):
                 northern_hemisphere=northern_hemisphere,
                 no_elevation=no_elevation,
                 n_noisy_epochs=n_noisy_epochs,
-                use_gt_in_planes=use_gt_in_planes
+                use_gt_in_planes=use_gt_in_planes,
+                transformer=transformer
             )
         elif camera_predictor_type == 'pe':
             self.camera_predictor = PEAzimuthElevationCameraPredictor(
@@ -226,6 +233,8 @@ class RadianceFieldRenderer(torch.nn.Module):
         self.mask_loss = mask_loss
         self.replication_loss = replication_loss
         self.replication_order = replication_order
+        self.n_epochs_mean = n_epochs_mean
+        self.epochs_coarse_only = epochs_coarse_only
 
     def precache_rays(
         self,
@@ -479,6 +488,11 @@ class RadianceFieldRenderer(torch.nn.Module):
         if image is not None:
             for render_pass in ("coarse", "fine"):
                 if self.replication_loss and not align_gt:
+                    if epoch is not None and epoch < self.n_epochs_mean:
+                        out["rgb_" + render_pass] = mix_paths(
+                            out["rgb_" + render_pass], self.replication_order)
+                        out["opacity_" + render_pass] = mix_paths(
+                            out["opacity_" + render_pass], self.replication_order)
                     if render_pass == "coarse":
                         metrics[f"mse_{render_pass}"], activated_paths = calc_replication_loss(
                             out["rgb_" + render_pass][..., :3],
@@ -527,6 +541,11 @@ class RadianceFieldRenderer(torch.nn.Module):
                             out["opacity_" + render_pass],
                             out["opacity_gt"]
                         )
+                # do not supervise fine network during 50 epochs
+                if epoch is not None and epoch < self.epochs_coarse_only:
+                    metrics["mse_fine"] = 0.
+                    if self.mask_loss:
+                        metrics["mse_mask_fine"] = 0.
             if self.replication_loss and not align_gt:
                 batch_size = camera_gt.R.shape[0]
                 camera = camera[activated_paths.cpu() * batch_size + torch.arange(batch_size)]
@@ -607,7 +626,11 @@ def visualize_nerf_outputs(
     # View directions.
     rotmat_gt = torch.cat([o["camera"].R for o in output_cache], 0)
     rotmat_pred = torch.cat([o["camera_pred"].R for o in output_cache], 0)
-    alignment, rotmat_pred_aligned = align_rotation_set(rotmat_gt, rotmat_pred)
+    alignment, rotmat_pred_aligned, mse_oop_deg, medse_oop_deg = align_rotation_set(rotmat_gt, rotmat_pred)
+
+    writer.add_scalar("MSE Poses", mse_oop_deg.cpu().detach().numpy(), steps)
+    writer.add_scalar("MedSE Poses", medse_oop_deg.cpu().detach().numpy(), steps)
+
     xy_gt = rotmat_to_2d_coords(rotmat_gt)
     xy_pred_aligned = rotmat_to_2d_coords(rotmat_pred_aligned)
     xy_gt = xy_gt.cpu().detach().numpy()

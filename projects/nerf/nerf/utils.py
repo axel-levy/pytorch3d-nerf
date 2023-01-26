@@ -37,6 +37,18 @@ def calc_replication_loss(x: torch.Tensor, y: torch.Tensor, replication_order: i
     return min_distances.mean(), activated_paths
 
 
+def mix_paths(x: torch.Tensor, replication_order: int):
+    """
+    x: [(replication_order * ) batch_size, ...]
+    """
+    replication_order_batch_size = x.shape[0]
+    batch_size = replication_order_batch_size // replication_order
+    x = x.reshape(replication_order, batch_size, *x.shape[1:])
+    x = torch.cat([torch.mean(x, dim=1)[None] * replication_order], 0)
+    x = x.reshape(-1, *x.shape[2:])
+    return x
+
+
 def sample_images_at_mc_locs(
     target_images: torch.Tensor,
     sampled_rays_xy: torch.Tensor,
